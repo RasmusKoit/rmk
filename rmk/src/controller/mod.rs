@@ -3,6 +3,7 @@
 //! This module defines the `Controller` trait and several macros for running output device controllers.
 //! The `Controller` trait provides the interface for individual output device controllers, and the macros facilitate their concurrent execution.
 
+#[cfg(feature = "display")]
 pub mod memlcd;
 pub(crate) mod wpm;
 
