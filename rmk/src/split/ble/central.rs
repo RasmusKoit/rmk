@@ -7,6 +7,11 @@ use embassy_sync::signal::Signal;
 use embassy_time::Duration;
 use embedded_storage_async::nor_flash::NorFlash;
 use trouble_host::prelude::*;
+#[cfg(feature = "controller")]
+use {
+    crate::channel::{send_controller_event, ControllerPub, CONTROLLER_CHANNEL},
+    crate::event::ControllerEvent,
+};
 
 use crate::ble::trouble::{update_ble_phy, update_conn_params};
 use crate::channel::FLASH_CHANNEL;
@@ -19,6 +24,8 @@ use crate::CONNECTION_STATE;
 
 pub(crate) static STACK_STARTED: Signal<crate::RawMutex, bool> = Signal::new();
 pub(crate) static PERIPHERAL_FOUND: Signal<crate::RawMutex, (u8, BdAddr)> = Signal::new();
+// A signal for indicating the sleep status for split central
+pub(crate) static CENTRAL_SLEEP: Signal<crate::RawMutex, bool> = Signal::new();
 
 /// Gatt service used in split central to send split message to peripheral
 #[gatt_service(uuid = "4dd5fbaa-18e5-4b07-bf0a-353698659946")]
@@ -85,7 +92,7 @@ impl EventHandler for ScanHandler {
             {
                 // Uuid and manufacturer specific data check passed
                 let peripheral_id = report.data[25];
-                info!("Found split peripheral: id={}, addr={}", peripheral_id, report.addr);
+                info!("Found split peripheral: id={:?}, addr={:?}", peripheral_id, report.addr);
                 PERIPHERAL_FOUND.signal((peripheral_id, report.addr));
                 break;
             }
@@ -161,13 +168,24 @@ pub(crate) async fn run_ble_peripheral_manager<
         },
     };
     wait_for_stack_started().await;
+
+    #[cfg(feature = "controller")]
+    let mut controller_pub = unwrap!(CONTROLLER_CHANNEL.publisher());
+
     loop {
+        #[cfg(feature = "controller")]
+        send_controller_event(
+            &mut controller_pub,
+            ControllerEvent::SplitPeripheral(peripheral_id, false),
+        );
         info!("Connecting peripheral");
         if let Err(e) = connect_and_run_peripheral_manager::<_, _, ROW, COL, ROW_OFFSET, COL_OFFSET>(
             peripheral_id,
             stack,
             &mut central,
             &config,
+            #[cfg(feature = "controller")]
+            &mut controller_pub,
         )
         .await
         {
@@ -193,10 +211,14 @@ async fn connect_and_run_peripheral_manager<
     stack: &'a Stack<'a, C, P>,
     central: &mut Central<'a, C, P>,
     config: &ConnectConfig<'_>,
+    #[cfg(feature = "controller")] controller_pub: &mut ControllerPub,
 ) -> Result<(), BleHostError<C::Error>> {
     let conn = central.connect(config).await?;
 
     info!("Connected to peripheral");
+
+    #[cfg(feature = "controller")]
+    send_controller_event(controller_pub, ControllerEvent::SplitPeripheral(id, true));
 
     let client = GattClient::<C, P, 10>::new(&stack, &conn).await?;
 
@@ -218,7 +240,7 @@ async fn connect_and_run_peripheral_manager<
     .await;
 
     match select(
-        ble_central_task(&client, &conn),
+        ble_central_task(stack, &client, &conn),
         run_peripheral_manager::<_, _, ROW, COL, ROW_OFFSET, COL_OFFSET>(id, &client),
     )
     .await
@@ -228,13 +250,47 @@ async fn connect_and_run_peripheral_manager<
     }
 }
 
-async fn ble_central_task<'a, C: Controller + ControllerCmdAsync<LeSetPhy>, P: PacketPool>(
+async fn ble_central_task<'a, 's, C: Controller + ControllerCmdAsync<LeSetPhy>, P: PacketPool>(
+    stack: &Stack<'s, C, P>,
     client: &GattClient<'a, C, P, 10>,
     conn: &Connection<'a, P>,
 ) -> Result<(), BleHostError<C::Error>> {
     let conn_check = async {
         while conn.is_connected() {
-            embassy_time::Timer::after_secs(1).await;
+            match select(CENTRAL_SLEEP.wait(), embassy_time::Timer::after_secs(1)).await {
+                Either::First(is_sleep) => {
+                    if is_sleep {
+                        // Change connection parameter for saving power
+                        update_conn_params(
+                            stack,
+                            conn,
+                            &ConnectParams {
+                                min_connection_interval: Duration::from_millis(200), // 200ms
+                                max_connection_interval: Duration::from_millis(200), // 200ms
+                                max_latency: 25,                                     // 5s
+                                supervision_timeout: Duration::from_secs(11),        // 11s
+                                ..Default::default()
+                            },
+                        )
+                        .await;
+                    } else {
+                        // Restore connection parameter when quiting sleep
+                        update_conn_params(
+                            stack,
+                            &conn,
+                            &ConnectParams {
+                                min_connection_interval: Duration::from_micros(7500), // 7.5ms
+                                max_connection_interval: Duration::from_micros(7500), // 7.5ms
+                                max_latency: 400,                                     // 3s
+                                supervision_timeout: Duration::from_secs(7),
+                                ..Default::default()
+                            },
+                        )
+                        .await;
+                    }
+                }
+                Either::Second(_) => continue,
+            }
         }
     };
     match select(client.task(), conn_check).await {

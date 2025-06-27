@@ -15,13 +15,21 @@ use rand_core::{CryptoRng, RngCore};
 use trouble_host::prelude::appearance::human_interface_device::KEYBOARD;
 use trouble_host::prelude::service::{BATTERY, HUMAN_INTERFACE_DEVICE};
 use trouble_host::prelude::*;
+
+#[cfg(feature = "split")]
+use crate::split::ble::central::CENTRAL_SLEEP;
+#[cfg(feature = "controller")]
+use {
+    crate::channel::{send_controller_event, CONTROLLER_CHANNEL},
+    crate::event::ControllerEvent,
+};
 #[cfg(not(feature = "_no_usb"))]
 use {
+    crate::descriptor::{CompositeReport, KeyboardReport, ViaReport},
     crate::light::UsbLedReader,
     crate::state::get_connection_type,
-    crate::descriptor::{CompositeReport, KeyboardReport, ViaReport},
     crate::usb::UsbKeyboardWriter,
-    crate::usb::{add_usb_reader_writer, new_usb_builder, add_usb_writer},
+    crate::usb::{add_usb_reader_writer, add_usb_writer, new_usb_builder},
     crate::usb::{USB_ENABLED, USB_SUSPENDED},
     crate::via::UsbVialReaderWriter,
     embassy_futures::select::{select4, Either4},
@@ -41,6 +49,8 @@ use crate::hid::{DummyWriter, RunnableHidWriter};
 use crate::keymap::KeyMap;
 use crate::light::{LedIndicator, LightController};
 use crate::state::{ConnectionState, ConnectionType};
+#[cfg(feature = "usb_log")]
+use crate::usb::add_usb_logger;
 use crate::{run_keyboard, CONNECTION_STATE};
 
 pub(crate) mod battery_service;
@@ -97,21 +107,30 @@ pub(crate) async fn run_ble<
 ) {
     // Initialize usb device and usb hid reader/writer
     #[cfg(not(feature = "_no_usb"))]
-    let (mut usb_device, mut keyboard_reader, mut keyboard_writer, mut other_writer, mut vial_reader_writer) = {
+    let (mut _usb_builder, mut keyboard_reader, mut keyboard_writer, mut other_writer, mut vial_reader_writer) = {
         let mut usb_builder: embassy_usb::Builder<'_, D> = new_usb_builder(usb_driver, rmk_config.usb_config);
         let keyboard_reader_writer = add_usb_reader_writer!(&mut usb_builder, KeyboardReport, 1, 8);
         let other_writer = add_usb_writer!(&mut usb_builder, CompositeReport, 9);
         let vial_reader_writer = add_usb_reader_writer!(&mut usb_builder, ViaReport, 32, 32);
         let (keyboard_reader, keyboard_writer) = keyboard_reader_writer.split();
-        let usb_device = usb_builder.build();
         (
-            usb_device,
+            usb_builder,
             keyboard_reader,
             keyboard_writer,
             other_writer,
             vial_reader_writer,
         )
     };
+
+    // Optional usb logger initialization
+    #[cfg(all(feature = "usb_log", not(feature = "_no_usb")))]
+    let usb_logger = add_usb_logger!(&mut _usb_builder);
+
+    #[cfg(not(feature = "_no_usb"))]
+    let mut usb_device = _usb_builder.build();
+
+    #[cfg(feature = "controller")]
+    let mut controller_pub = unwrap!(CONTROLLER_CHANNEL.publisher());
 
     // Load current connection type
     #[cfg(feature = "storage")]
@@ -128,10 +147,20 @@ pub(crate) async fn run_ble<
             #[cfg(not(feature = "_no_usb"))]
             CONNECTION_TYPE.store(ConnectionType::Usb.into(), Ordering::SeqCst);
         }
+
+        #[cfg(feature = "controller")]
+        send_controller_event(
+            &mut controller_pub,
+            ControllerEvent::ConnectionType(CONNECTION_TYPE.load(Ordering::SeqCst)),
+        );
     }
 
     // Create profile manager
-    let mut profile_manager = ProfileManager::new(&stack);
+    let mut profile_manager = ProfileManager::new(
+        &stack,
+        #[cfg(feature = "controller")]
+        controller_pub,
+    );
 
     #[cfg(feature = "storage")]
     // Load saved bonding information
@@ -177,8 +206,16 @@ pub(crate) async fn run_ble<
         )
         .unwrap();
 
-    #[cfg(not(feature = "_no_usb"))]
+    #[cfg(all(not(feature = "usb_log"), not(feature = "_no_usb")))]
     let background_task = join(ble_task(runner), usb_device.run());
+    #[cfg(all(feature = "usb_log", not(feature = "_no_usb")))]
+    let background_task = join(
+        ble_task(runner),
+        select(
+            usb_device.run(),
+            embassy_usb_logger::with_class!(1024, log::LevelFilter::Debug, usb_logger),
+        ),
+    );
     #[cfg(feature = "_no_usb")]
     let background_task = ble_task(runner);
 
@@ -239,8 +276,17 @@ pub(crate) async fn run_ble<
 
                                 // Set CONNECTION_STATE to true to keep receiving messages from the peripheral
                                 CONNECTION_STATE.store(ConnectionState::Connected.into(), Ordering::Release);
+
+                                // Change the connection parameter to reduce the power consumption
+                                #[cfg(feature = "split")]
+                                CENTRAL_SLEEP.signal(true);
+
                                 // Wait for the keyboard report for wake the keyboard
                                 let _ = KEYBOARD_REPORT_CHANNEL.receive().await;
+
+                                // Restore the connection parameter
+                                #[cfg(feature = "split")]
+                                CENTRAL_SLEEP.signal(false);
                                 continue;
                             }
                             _ => {}
@@ -278,12 +324,25 @@ pub(crate) async fn run_ble<
                                 .await;
                             }
                             Either3::First(Err(BleHostError::BleHost(Error::Timeout))) => {
+                                #[cfg(feature = "split")]
+                                use crate::split::ble::central::CENTRAL_SLEEP;
+
                                 warn!("Advertising timeout, sleep and wait for any key");
 
                                 // Set CONNECTION_STATE to true to keep receiving messages from the peripheral
                                 CONNECTION_STATE.store(ConnectionState::Connected.into(), Ordering::Release);
+
+                                // Change the connection parameter to reduce the power consumption
+                                #[cfg(feature = "split")]
+                                CENTRAL_SLEEP.signal(true);
+
                                 // Wait for the keyboard report for wake the keyboard
                                 let _ = KEYBOARD_REPORT_CHANNEL.receive().await;
+
+                                // Restore the connection parameter
+                                #[cfg(feature = "split")]
+                                CENTRAL_SLEEP.signal(false);
+
                                 continue;
                             }
                             _ => {}
@@ -390,80 +449,71 @@ async fn gatt_events_task(server: &Server<'_>, conn: &GattConnection<'_, '_, Def
                 };
                 UPDATED_PROFILE.signal(profile_info);
             }
-            GattConnectionEvent::Gatt { event } => {
-                match event {
-                    Ok(event) => {
-                        let mut cccd_updated = false;
-                        let result = match &event {
-                            GattEvent::Read(event) => {
-                                if event.handle() == level.handle {
-                                    let value = server.get(&level);
-                                    debug!("Read GATT Event to Level: {:?}", value);
-                                } else {
-                                    debug!("Read GATT Event to Unknown: {:?}", event.handle());
-                                }
-
-                                if conn.raw().encrypted() {
-                                    None
-                                } else {
-                                    Some(AttErrorCode::INSUFFICIENT_ENCRYPTION)
-                                }
-                            }
-                            GattEvent::Write(event) => {
-                                if event.handle() == output_keyboard.handle {
-                                    let led_indicator = LedIndicator::from_bits(event.data()[0]);
-                                    debug!("Got keyboard state: {:?}", led_indicator);
-                                    LED_SIGNAL.signal(led_indicator);
-                                } else if event.handle() == output_via.handle {
-                                    debug!("Got via packet: {:?}", event.data());
-                                    let data = unsafe { *(event.data().as_ptr() as *const [u8; 32]) };
-                                    VIAL_READ_CHANNEL.send(data).await;
-                                } else if event.handle()
-                                    == input_keyboard.cccd_handle.expect("No CCCD for input keyboard")
-                                    || event.handle() == input_via.cccd_handle.expect("No CCCD for input via")
-                                    || event.handle() == mouse.cccd_handle.expect("No CCCD for mouse report")
-                                    || event.handle() == media.cccd_handle.expect("No CCCD for media report")
-                                    || event.handle() == system_control.cccd_handle.expect("No CCCD for system report")
-                                    || event.handle() == battery_level.cccd_handle.expect("No CCCD for battery level")
-                                {
-                                    // CCCD write event
-                                    cccd_updated = true;
-                                } else {
-                                    debug!("Write GATT Event to Unknown: {:?}", event.handle());
-                                }
-
-                                if conn.raw().encrypted() {
-                                    None
-                                } else {
-                                    Some(AttErrorCode::INSUFFICIENT_ENCRYPTION)
-                                }
-                            }
-                        };
-
-                        // This step is also performed at drop(), but writing it explicitly is necessary
-                        // in order to ensure reply is sent.
-                        let result = if let Some(code) = result {
-                            event.reject(code)
+            GattConnectionEvent::Gatt { event: gatt_event } => {
+                let mut cccd_updated = false;
+                let result = match &gatt_event {
+                    GattEvent::Read(event) => {
+                        if event.handle() == level.handle {
+                            let value = server.get(&level);
+                            debug!("Read GATT Event to Level: {:?}", value);
                         } else {
-                            event.accept()
-                        };
-                        match result {
-                            Ok(reply) => {
-                                reply.send().await;
-                            }
-                            Err(e) => {
-                                warn!("[gatt] error sending response: {:?}", e);
-                            }
+                            debug!("Read GATT Event to Unknown: {:?}", event.handle());
                         }
 
-                        // Update CCCD table after processing the event
-                        if cccd_updated {
-                            if let Some(table) = server.get_cccd_table(conn.raw()) {
-                                UPDATED_CCCD_TABLE.signal(table);
-                            }
+                        if conn.raw().encrypted() {
+                            None
+                        } else {
+                            Some(AttErrorCode::INSUFFICIENT_ENCRYPTION)
                         }
                     }
-                    Err(e) => warn!("[gatt] error processing event: {:?}", e),
+                    GattEvent::Write(event) => {
+                        if event.handle() == output_keyboard.handle {
+                            let led_indicator = LedIndicator::from_bits(event.data()[0]);
+                            debug!("Got keyboard state: {:?}", led_indicator);
+                            LED_SIGNAL.signal(led_indicator);
+                        } else if event.handle() == output_via.handle {
+                            debug!("Got via packet: {:?}", event.data());
+                            let data = unsafe { *(event.data().as_ptr() as *const [u8; 32]) };
+                            VIAL_READ_CHANNEL.send(data).await;
+                        } else if event.handle() == input_keyboard.cccd_handle.expect("No CCCD for input keyboard")
+                            || event.handle() == input_via.cccd_handle.expect("No CCCD for input via")
+                            || event.handle() == mouse.cccd_handle.expect("No CCCD for mouse report")
+                            || event.handle() == media.cccd_handle.expect("No CCCD for media report")
+                            || event.handle() == system_control.cccd_handle.expect("No CCCD for system report")
+                            || event.handle() == battery_level.cccd_handle.expect("No CCCD for battery level")
+                        {
+                            // CCCD write event
+                            cccd_updated = true;
+                        } else {
+                            debug!("Write GATT Event to Unknown: {:?}", event.handle());
+                        }
+
+                        if conn.raw().encrypted() {
+                            None
+                        } else {
+                            Some(AttErrorCode::INSUFFICIENT_ENCRYPTION)
+                        }
+                    }
+                    GattEvent::Other(_) => None,
+                };
+
+                // This step is also performed at drop(), but writing it explicitly is necessary
+                // in order to ensure reply is sent.
+                let result = if let Some(code) = result {
+                    gatt_event.reject(code)
+                } else {
+                    gatt_event.accept()
+                };
+                match result {
+                    Ok(reply) => reply.send().await,
+                    Err(e) => warn!("[gatt] error sending response: {:?}", e),
+                }
+
+                // Update CCCD table after processing the event
+                if cccd_updated {
+                    if let Some(table) = server.get_cccd_table(conn.raw()) {
+                        UPDATED_CCCD_TABLE.signal(table);
+                    }
                 }
             }
             GattConnectionEvent::PhyUpdated { tx_phy, rx_phy } => {
