@@ -58,7 +58,12 @@ fn generate_vial_config() {
     // Generated vial config file
     let out_file = Path::new(&env::var_os("OUT_DIR").unwrap()).join("config_generated.rs");
 
-    let p = Path::new("vial.json");
+    let vial_json_path = if let Ok(path) = std::env::var("VIAL_JSON_PATH") {
+        path
+    } else {
+        "vial.json".to_string()
+    };
+    let p = Path::new(&vial_json_path);
     let mut content = String::new();
     match File::open(p) {
         Ok(mut file) => {
