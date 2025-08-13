@@ -1152,6 +1152,7 @@ checksum = "0bfb9eb618601c89945a70e254898da93b13be0388091d42117462b265bb3fad"
 dependencies = [
  "defmt 0.3.100",
  "hash32 0.3.1",
+ "serde",
  "stable_deref_trait",
 ]
 
@@ -1627,6 +1628,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "postcard-rpc"
+version = "0.11.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1af23d87c9a8308bbfaae655ac770ec10517e6448fa5e0b50838a36e5d860b9"
+dependencies = [
+ "embassy-executor",
+ "embassy-futures",
+ "embassy-sync",
+ "embassy-time",
+ "embassy-usb",
+ "embassy-usb-driver",
+ "heapless 0.8.0",
+ "portable-atomic",
+ "postcard",
+ "postcard-schema",
+ "serde",
+ "static_cell",
+ "thiserror",
+]
+
+[[package]]
+name = "postcard-schema"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f5a13d8b1f8b3473b45c2c779b97c18c260ac6458eb045d4be75df8087784400"
+dependencies = [
+ "postcard-derive",
+ "serde",
+]
+
+[[package]]
 name = "ppv-lite86"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1784,9 +1816,11 @@ dependencies = [
  "num_enum",
  "paste",
  "postcard",
+ "postcard-rpc",
  "rand_core 0.6.4",
  "rmk-config",
  "rmk-macro",
+ "rmk-protocol",
  "sequential-storage",
  "serde",
  "serde_derive",
@@ -1855,6 +1889,17 @@ dependencies = [
  "rmk",
  "static_cell",
  "xz2",
+]
+
+[[package]]
+name = "rmk-protocol"
+version = "0.1.0"
+dependencies = [
+ "heapless 0.8.0",
+ "postcard",
+ "postcard-rpc",
+ "postcard-schema",
+ "serde",
 ]
 
 [[package]]

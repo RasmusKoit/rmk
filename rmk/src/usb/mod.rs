@@ -4,9 +4,11 @@ use embassy_sync::signal::Signal;
 use embassy_usb::class::hid::{HidWriter, ReportId, RequestHandler};
 use embassy_usb::control::OutResponse;
 use embassy_usb::driver::Driver;
-use embassy_usb::{Builder, Handler};
+use embassy_usb::{Builder, Config, Handler};
+use postcard_rpc::server::impls::embassy_usb_v0_5::PacketBuffers;
+use postcard_rpc::server::impls::embassy_usb_v0_5::dispatch_impl::WireStorage;
 use ssmarshal::serialize;
-use static_cell::StaticCell;
+use static_cell::{ConstStaticCell, StaticCell};
 
 use crate::channel::KEYBOARD_REPORT_CHANNEL;
 use crate::config::KeyboardUsbConfig;
@@ -106,8 +108,7 @@ impl<'d, D: Driver<'d>> HidWriterTrait for UsbKeyboardWriter<'_, 'd, D> {
     }
 }
 
-pub(crate) fn new_usb_builder<'d, D: Driver<'d>>(driver: D, keyboard_config: KeyboardUsbConfig<'d>) -> Builder<'d, D> {
-    // Create embassy-usb Config
+pub(crate) fn usb_config<'d>(keyboard_config: KeyboardUsbConfig<'d>) -> Config<'d> {
     let mut usb_config = embassy_usb::Config::new(keyboard_config.vid, keyboard_config.pid);
     usb_config.manufacturer = Some(keyboard_config.manufacturer);
     usb_config.product = Some(keyboard_config.product_name);
@@ -121,6 +122,12 @@ pub(crate) fn new_usb_builder<'d, D: Driver<'d>>(driver: D, keyboard_config: Key
     usb_config.device_sub_class = 0x02;
     usb_config.device_protocol = 0x01;
     usb_config.composite_with_iads = true;
+    usb_config
+}
+
+pub(crate) fn new_usb_builder<'d, D: Driver<'d>>(driver: D, keyboard_config: KeyboardUsbConfig<'d>) -> Builder<'d, D> {
+    // Create embassy-usb Config
+    let usb_config = usb_config(keyboard_config);
 
     #[cfg(feature = "usb_log")]
     const USB_BUF_SIZE: usize = 256;
@@ -228,7 +235,7 @@ impl RequestHandler for UsbRequestHandler {
 pub(crate) struct UsbDeviceHandler {}
 
 impl UsbDeviceHandler {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         UsbDeviceHandler {}
     }
 }

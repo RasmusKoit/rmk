@@ -12,6 +12,7 @@ resolver = "2"
 
 [dependencies]
 rmk-macro = { version = "=0.6.8", path = "../rmk-macro" }
+rmk-protocol = { version = "=0.1.0", path = "../rmk-protocol" }
 embedded-hal = { version = "1.0.0" }
 embedded-hal-async = { version = "1.0.0", optional = true }
 embedded-io-async = { version = "0.6" }
@@ -52,6 +53,8 @@ postcard = { version = "1", features = ["experimental-derive"] }
 paste = "1"
 
 # Optional dependencies
+# postcard-rpc dependencies
+postcard-rpc = { version = "0.11", default-features = false, features = ["embassy-usb-0_5-server"] }
 # BLE dependencies
 trouble-host = { version = "0.2.4", features = [
     "gatt",
@@ -110,6 +113,9 @@ cortex-m = { version = "0.7" }
 [features]
 default = ["col2row", "defmt", "storage", "vial_lock"]
 
+## Enable postcard-rpc protocol for configuration
+# postcard_rpc = ["dep:postcard-rpc", "dep:rmk-protocol", "storage"]
+
 ## the matrix tester is optional to store matrix state
 matrix_tester = []
 
@@ -140,6 +146,7 @@ defmt = [
     "trouble-host?/defmt",
     "bt-hci?/defmt",
     "heapless/defmt-03",
+    # "rmk-protocol?/defmt",
 ]
 
 log = ["dep:log", "trouble-host?/log"]

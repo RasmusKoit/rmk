@@ -22,6 +22,7 @@ use core::cell::RefCell;
 use core::future::Future;
 use core::sync::atomic::Ordering;
 
+use ::postcard_rpc::define_dispatch;
 #[cfg(feature = "_ble")]
 use bt_hci::{
     cmd::le::{LeReadLocalSupportedFeatures, LeSetPhy},
@@ -105,6 +106,9 @@ pub mod tap_dance;
 #[cfg(not(feature = "_no_usb"))]
 pub mod usb;
 pub mod via;
+
+/// Postcard-RPC service (alternative to Via/Vial)
+mod postcard_rpc;
 
 pub async fn initialize_keymap<'a, const ROW: usize, const COL: usize, const NUM_LAYER: usize>(
     default_keymap: &'a mut [[[action::KeyAction; COL]; ROW]; NUM_LAYER],
@@ -213,11 +217,44 @@ pub async fn run_rmk<
         rmk_config,
     )
     .await;
+    use crate::RawMutex;
+    use ::postcard_rpc::server::SpawnContext;
+    use rmk_protocol::{
+        endpoints::RMK_ENDPOINT_LIST,
+        topics::{RMK_TOPICS_IN_LIST, RMK_TOPICS_OUT_LIST},
+    };
+
+    // Import the postcard-rpc embassy-usb implementation
+    use ::postcard_rpc::server::impls::embassy_usb_v0_5::dispatch_impl::{WireSpawnImpl, WireTxImpl, spawn_fn};
+
+    // Import the handler functions
+    use crate::postcard_rpc::handlers::system::handle_get_protocol_version;
+    // Define the dispatch table for RMK endpoints
 
     // USB keyboard
     #[cfg(all(not(feature = "_no_usb"), not(feature = "_ble")))]
     {
-        let mut usb_builder: embassy_usb::Builder<'_, D> = new_usb_builder(usb_driver, rmk_config.usb_config);
+        use ::postcard_rpc::server::impls::embassy_usb_v0_5::{PacketBuffers, dispatch_impl::WireStorage};
+        use static_cell::{ConstStaticCell, StaticCell};
+
+        use crate::usb::{UsbDeviceHandler, usb_config};
+
+        static PBUFS: ConstStaticCell<PacketBuffers<1024, 1024>> =
+            ConstStaticCell::new(PacketBuffers::<1024, 1024>::new());
+        let wire_storage: WireStorage<crate::RawMutex, D> = WireStorage::new();
+
+        // Create embassy-usb Config
+        let pbufs = PBUFS.take();
+        let (usb_builder, tx_impl, rx_impl) = wire_storage.init_without_build(
+            usb_driver,
+            usb_config(rmk_config.usb_config),
+            pbufs.tx_buf.as_mut_slice(),
+        );
+
+        static device_handler: StaticCell<UsbDeviceHandler> = StaticCell::new();
+        usb_builder.handler(device_handler.init(UsbDeviceHandler::new()));
+
+        // let mut usb_builder: embassy_usb::Builder<'_, D> = new_usb_builder(usb_driver, rmk_config.usb_config);
         let keyboard_reader_writer = add_usb_reader_writer!(&mut usb_builder, KeyboardReport, 1, 8);
         let mut other_writer = add_usb_writer!(&mut usb_builder, CompositeReport, 9);
         let mut vial_reader_writer = add_usb_reader_writer!(&mut usb_builder, ViaReport, 32, 32);
@@ -228,18 +265,35 @@ pub async fn run_rmk<
             let usb_logger = crate::usb::add_usb_logger!(&mut usb_builder);
             embassy_usb_logger::with_class!(1024, log::LevelFilter::Debug, usb_logger)
         };
+
         #[cfg(not(feature = "usb_log"))]
         let logger_fut = async {};
         let mut usb_device = usb_builder.build();
 
+        // Create postcard-rpc server task if feature is enabled
+        let postcard_rpc_fut = {
+            use ::postcard_rpc::server::Server;
+
+            let context = postcard_rpc::RmkContext::new();
+            let dispatcher = postcard_rpc::RmkApp::new(context, embassy_executor::Spawner::for_current_executor());
+            let vkk = dispatcher.min_key_len();
+
+            let mut postcard_server = Server::new(tx_impl, rx_impl, pbufs.rx_buf.as_mut_slice(), dispatcher, vkk);
+
+            async move {
+                loop {
+                    let _ = postcard_server.run().await;
+                }
+            }
+        };
+
         // Run all tasks, if one of them fails, wait 1 second and then restart
-        embassy_futures::join::join(logger_fut, async {
+        embassy_futures::join::join3(logger_fut, postcard_rpc_fut, async {
             loop {
                 let usb_task = async {
                     loop {
-                        use embassy_futures::select::{Either, select};
-
                         use crate::usb::USB_REMOTE_WAKEUP;
+                        use embassy_futures::select::{Either, select};
 
                         usb_device.run_until_suspend().await;
                         match select(usb_device.wait_resume(), USB_REMOTE_WAKEUP.wait()).await {
