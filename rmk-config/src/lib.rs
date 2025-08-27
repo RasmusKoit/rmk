@@ -11,6 +11,7 @@ pub mod communication;
 pub mod keyboard;
 #[rustfmt::skip]
 pub mod usb_interrupt_map;
+pub mod backlight;
 pub mod behavior;
 pub mod board;
 pub mod keycode_alias;
@@ -186,6 +187,8 @@ pub struct KeyboardTomlConfig {
     behavior: Option<BehaviorConfig>,
     /// Light config
     light: Option<LightConfig>,
+    /// Backlight config
+    backlight: Option<BacklightConfig>,
     /// Storage config
     storage: Option<StorageConfig>,
     /// Ble config
@@ -371,6 +374,12 @@ pub struct LightConfig {
     pub capslock: Option<PinConfig>,
     pub scrolllock: Option<PinConfig>,
     pub numslock: Option<PinConfig>,
+}
+
+#[derive(Clone, Default, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BacklightConfig {
+    pub backlight: Option<PinConfig>,
 }
 
 /// Config for a single pin

@@ -1259,6 +1259,15 @@ impl<'a, const ROW: usize, const COL: usize, const NUM_LAYER: usize, const NUM_E
         self.send_keyboard_report_with_resolved_modifiers(event.pressed).await;
     }
 
+    async fn process_action_keycode(&mut self, key: KeyCode) {
+        if key.is_backlight() {
+            #[cfg(feature = "controller")]
+            send_controller_event(&mut self.controller_pub, ControllerEvent::BacklightToggle);
+        } else {
+            warn!("Unsupported action key: {:?}", key);
+        }
+    }
+
     // Process action key
     async fn process_action_key(&mut self, key: KeyCode, event: KeyboardEvent) {
         let key = match key {

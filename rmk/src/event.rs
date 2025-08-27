@@ -204,6 +204,8 @@ pub enum ControllerEvent {
     SplitCentral(bool),
     /// Lock state led indicator
     KeyboardIndicator(LedIndicator),
+    /// Backlight toggle
+    BacklightToggle,
     /// Ble state changed
     #[cfg(feature = "_ble")]
     BleState(u8, crate::ble::trouble::BleState),
